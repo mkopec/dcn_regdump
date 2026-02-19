@@ -2,4 +2,5 @@
 
 Utility for dumping HDMI related registers from the DCN of an AMD GPU.
 
-Currently only DCN401 (RX 9000 series) is supported.
+Currently only DCN401 (RX 9000 series) is supported. Running on other GPUS is
+not supported and may cause your GPU to crash!
