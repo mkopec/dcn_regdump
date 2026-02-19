@@ -54,7 +54,7 @@ reg_read() {
 		value=$(mmio_read32 $(( $rbase + 4 * (dcn_base[${reg_name}_BASE_IDX] + $reg_name))))
 		echo $value
 		local reg_basename=$(echo $reg_name | tr -d reg)
-		readarray -d '' -t fields < <(grep ${reg_basename}__ dcn410_sh_mask.txt | cut -d '=' -f 1 | grep MASK)
+		readarray -d '' -t fields < <(grep ${reg_basename}__ dcn410_sh_mask.txt | grep "_MASK=" | cut -d '=' -f 1)
 		for field in ${fields[@]}; do
 				base_name="${field%"_MASK"}"
 				field_name="${base_name#"$reg_basename"}"
