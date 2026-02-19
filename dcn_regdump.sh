@@ -1,5 +1,16 @@
 #!/bin/bash
 
+if [ $UID -ne 0 ]; then
+		echo "This script must be run as root!"
+		exit 1
+fi
+
+iotools_path=$(which iotools)
+if [ $? -ne 0 ]; then
+		echo "iotools not found! Please install iotools from https://github.com/adurbin/iotools.git first."
+		exit 1
+fi
+
 gpu_bdf=$(lspci -D -d 1002: | grep -E "VGA|Display|3D" | head -n 1 | awk '{print $1}')
 
 if [ -z "$gpu_bdf" ]; then
