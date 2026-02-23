@@ -173,8 +173,9 @@ load_registers() {
 		# Parse offset header: #define (reg|mm)NAME 0xVALUE  →  (reg|mm)NAME=0xVALUE
 		source <(grep -E '^#define[[:space:]]+(reg|mm)[A-Za-z0-9_]+[[:space:]]' "$OFFSET_FILE" | \
 		         awk '{print $2 "=" $3}')
-		# Parse sh_mask header: #define NAME__SHIFT/MASK VALUE  →  NAME__SHIFT=VALUE
-		source <(grep -E '^#define[[:space:]]+[A-Za-z0-9_]+__(SHIFT|MASK)[[:space:]]' "$SHMASK_FILE" | \
+		# Parse sh_mask header: NAME__FIELDNAME__SHIFT and NAME__FIELDNAME_MASK
+		# SHIFT uses double underscore prefix, MASK uses single underscore prefix.
+		source <(grep -E '^#define[[:space:]]+[A-Za-z0-9_]+(_MASK|__SHIFT)[[:space:]]' "$SHMASK_FILE" | \
 		         awk '{print $2 "=" $3}')
 	fi
 }
@@ -217,11 +218,11 @@ reg_read() {
 	if [ "$USE_TXT" -eq 1 ]; then
 		readarray -d '' -t fields < <(grep "${reg_basename}__" "$SHMASK_FILE" | grep "_MASK=" | cut -d '=' -f 1)
 	else
-		readarray -d '' -t fields < <(grep -E "^#define[[:space:]]+${reg_basename}__[A-Za-z0-9_]+__MASK[[:space:]]" "$SHMASK_FILE" | awk '{print $2}')
+		readarray -d '' -t fields < <(grep -E "^#define[[:space:]]+${reg_basename}__[A-Za-z0-9_]+_MASK[[:space:]]" "$SHMASK_FILE" | awk '{print $2}')
 	fi
 
 	for field in ${fields[@]}; do
-		local base_name="${field%__MASK}"
+		local base_name="${field%_MASK}"
 		local field_name="${base_name#"${reg_basename}"}"
 		field_name="${field_name#__}"
 		local shift_field="${base_name}__SHIFT"
