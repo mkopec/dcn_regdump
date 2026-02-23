@@ -1,762 +1,268 @@
 #!/bin/bash
+# dcn_regdump.sh - Generic AMD GPU DCN register dump tool
+# Automatically detects DCN version from dmesg and dumps relevant display registers.
+# Supports reading from preprocessed .txt files or raw C header files in dcn_reg/.
 
 if [ $UID -ne 0 ]; then
-		echo "This script must be run as root!"
-		exit 1
+	echo "This script must be run as root!"
+	exit 1
 fi
 
-iotools_path=$(which iotools)
-if [ $? -ne 0 ]; then
-		echo "iotools not found! Please install iotools from https://github.com/adurbin/iotools.git first."
-		exit 1
+if ! which iotools &>/dev/null; then
+	echo "iotools not found! Please install iotools from https://github.com/adurbin/iotools.git first."
+	exit 1
 fi
 
-gpu_bdf=$(lspci -D -d 1002: | grep -E "VGA|Display|3D" | head -n 1 | awk '{print $1}')
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -z "$gpu_bdf" ]; then
-    echo "Error: No AMD GPU found on this system."
-    exit 1
-fi
+# ---------------------------------------------------------------------------
+# DCN version → header file prefix mapping table.
+# Normally dmesg "X.Y.Z" maps directly to dcn_X_Y_Z_offset.h (dots → underscores).
+# List special cases where the dmesg version string differs from the file naming.
+# ---------------------------------------------------------------------------
+declare -A DCN_VERSION_MAP
+DCN_VERSION_MAP["4.0.1"]="4_1_0"   # DCN 4.0.1 hardware uses dcn_4_1_0 header files
 
-echo "Found AMD GPU at $gpu_bdf"
-
-resource_file="/sys/bus/pci/devices/$gpu_bdf/resource"
-
-if [ ! -f "$resource_file" ]; then
-    echo "Error: Resource file not found at $resource_file"
-    exit 1
-fi
-
-echo "Found resource file at $resource_file"
-
-last_bar_raw=$(head -n 6 "$resource_file" | awk '{print "BAR"NR-1, $0}' | grep -v "0x0000000000000000 0x0000000000000000" | tail -n 1)
-
-# 4. Extract the specific details for cleaner output
-bar_name=$(echo "$last_bar_raw" | awk '{print $1}')
-bar_start=$(echo "$last_bar_raw" | awk '{print $2}')
-
-echo "Using $bar_name at $bar_start"
-
-# GPU register base
-rbase=$bar_start
-
-# DCN register bases by index
+# ---------------------------------------------------------------------------
+# DCN MMIO base address table indexed by BASE_IDX value.
+# NOTE: These values apply to RDNA3/4 hardware (DCN 3.2.x and 4.x.x).
+# Older GPU generations may require different values.
+# ---------------------------------------------------------------------------
 dcn_base[1]=$((0xc0))
 dcn_base[2]=$((0x34c0))
 dcn_base[3]=$((0x9000))
 
-source dcn410_regs.txt
-source dcn410_sh_mask.txt
+# ---------------------------------------------------------------------------
+# Register sections to discover and dump: "SECTION_TITLE:grep_prefix_pattern"
+# Each pattern is matched as a prefix against register names in the offset file.
+# Patterns support extended regex (passed to grep -E).
+# ---------------------------------------------------------------------------
+REG_SECTIONS=(
+	"PHY_MUX:regPHY_MUX"
+	"HDMICHARCLOCK:regHDMICHARCLK"
+	"HDMI:regHDMI"
+	"DIO:regDIO"
+	"DIG:regDIG"
+	"DCCG:regDCCG"
+	"HPO:regHPO"
+	"SYMCLK:regSYMCLK"
+	"PHY_SYMCLK:regPHY[A-G]SYMCLK"
+	"VPG:regVPG"
+	"DME:regDME"
+	"AFMT:regAFMT"
+	"DTBCLK:regDTBCLK"
+	"OTG:regOTG"
+	"DENTIST:regDENTIST"
+)
 
-reg_read() {
-		local reg_name=$1
-		echo -en "$reg_name: "
-		value=$(mmio_read32 $(( $rbase + 4 * (dcn_base[${reg_name}_BASE_IDX] + $reg_name))))
-		echo $value
-		local reg_basename=$(echo $reg_name | tr -d reg)
-		readarray -d '' -t fields < <(grep ${reg_basename}__ dcn410_sh_mask.txt | grep "_MASK=" | cut -d '=' -f 1)
-		for field in ${fields[@]}; do
-				base_name="${field%"_MASK"}"
-				field_name="${base_name#"$reg_basename"}"
-				field_name="${field_name#"__"}"
-				shift_field="${base_name}__SHIFT"
-				mask_val="${!field}"
-				shift_val="${!shift_field}"
-				echo "    $field_name: $((($value & ${mask_val%"L"}) >> $shift_val))"
-		done
+# ---------------------------------------------------------------------------
+# GPU PCI detection
+# ---------------------------------------------------------------------------
+gpu_bdf=$(lspci -D -d 1002: | grep -E "VGA|Display|3D" | head -n 1 | awk '{print $1}')
+if [ -z "$gpu_bdf" ]; then
+	echo "Error: No AMD GPU found on this system."
+	exit 1
+fi
+echo "Found AMD GPU at $gpu_bdf"
+
+resource_file="/sys/bus/pci/devices/$gpu_bdf/resource"
+if [ ! -f "$resource_file" ]; then
+	echo "Error: Resource file not found at $resource_file"
+	exit 1
+fi
+echo "Found resource file at $resource_file"
+
+last_bar_raw=$(head -n 6 "$resource_file" | awk '{print "BAR"NR-1, $0}' | grep -v "0x0000000000000000 0x0000000000000000" | tail -n 1)
+bar_name=$(echo "$last_bar_raw" | awk '{print $1}')
+bar_start=$(echo "$last_bar_raw" | awk '{print $2}')
+echo "Using $bar_name at $bar_start"
+rbase=$bar_start
+
+# ---------------------------------------------------------------------------
+# detect_dcn_version: parse dmesg for "initialized on DCN X.Y.Z"
+# ---------------------------------------------------------------------------
+detect_dcn_version() {
+	dmesg 2>/dev/null | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}'
 }
 
+# ---------------------------------------------------------------------------
+# find_reg_files: locate offset + sh_mask files for a given DCN version string.
+# Sets globals: OFFSET_FILE, SHMASK_FILE, USE_TXT (1=.txt, 0=.h)
+# Preference order: preprocessed .txt files, then raw .h headers.
+# ---------------------------------------------------------------------------
+find_reg_files() {
+	local dcn_ver="$1"
+	local file_prefix compact_ver
 
-echo -e "\n====PHY_MUX===="
-reg_read regPHY_MUX0_PHY_MUX_CONTROL
-reg_read regPHY_MUX0_PORT_TYPE
-reg_read regPHY_MUX1_PHY_MUX_CONTROL
-reg_read regPHY_MUX1_PORT_TYPE
-reg_read regPHY_MUX2_PHY_MUX_CONTROL
-reg_read regPHY_MUX2_PORT_TYPE
-reg_read regPHY_MUX3_PHY_MUX_CONTROL
-reg_read regPHY_MUX3_PORT_TYPE
+	# 1. Try preprocessed .txt files with direct version (e.g. 3.2.1 → dcn321_regs.txt)
+	compact_ver="${dcn_ver//./}"    # 3.2.1 → 321
+	if [ -f "$SCRIPT_DIR/dcn${compact_ver}_regs.txt" ] && \
+	   [ -f "$SCRIPT_DIR/dcn${compact_ver}_sh_mask.txt" ]; then
+		OFFSET_FILE="$SCRIPT_DIR/dcn${compact_ver}_regs.txt"
+		SHMASK_FILE="$SCRIPT_DIR/dcn${compact_ver}_sh_mask.txt"
+		USE_TXT=1
+		return 0
+	fi
 
-echo -e "\n====HDMI===="
-reg_read regHDMICHARCLK0_CLOCK_CNTL
-reg_read regHDMICHARCLK1_CLOCK_CNTL
-reg_read regHDMICHARCLK2_CLOCK_CNTL
-reg_read regHDMICHARCLK3_CLOCK_CNTL
-reg_read regHDMICHARCLK4_CLOCK_CNTL
-reg_read regHDMICHARCLK5_CLOCK_CNTL
-reg_read regHDMISTREAMCLK_CNTL
-reg_read regHDMISTREAMCLK0_DTO_PARAM
-reg_read regDIG0_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG0_HDMI_CONTROL
-reg_read regDIG0_HDMI_STATUS
-reg_read regDIG0_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG0_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG0_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG0_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG0_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG0_HDMI_GC
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG0_HDMI_DB_CONTROL
-reg_read regDIG0_HDMI_ACR_32_0
-reg_read regDIG0_HDMI_ACR_32_1
-reg_read regDIG0_HDMI_ACR_44_0
-reg_read regDIG0_HDMI_ACR_44_1
-reg_read regDIG0_HDMI_ACR_48_0
-reg_read regDIG0_HDMI_ACR_48_1
-reg_read regDIG0_HDMI_ACR_STATUS_0
-reg_read regDIG0_HDMI_ACR_STATUS_1
-reg_read regDIG1_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG1_HDMI_CONTROL
-reg_read regDIG1_HDMI_STATUS
-reg_read regDIG1_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG1_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG1_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG1_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG1_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG1_HDMI_GC
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG1_HDMI_DB_CONTROL
-reg_read regDIG1_HDMI_ACR_32_0
-reg_read regDIG1_HDMI_ACR_32_1
-reg_read regDIG1_HDMI_ACR_44_0
-reg_read regDIG1_HDMI_ACR_44_1
-reg_read regDIG1_HDMI_ACR_48_0
-reg_read regDIG1_HDMI_ACR_48_1
-reg_read regDIG1_HDMI_ACR_STATUS_0
-reg_read regDIG1_HDMI_ACR_STATUS_1
-reg_read regDIG2_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG2_HDMI_CONTROL
-reg_read regDIG2_HDMI_STATUS
-reg_read regDIG2_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG2_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG2_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG2_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG2_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG2_HDMI_GC
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG2_HDMI_DB_CONTROL
-reg_read regDIG2_HDMI_ACR_32_0
-reg_read regDIG2_HDMI_ACR_32_1
-reg_read regDIG2_HDMI_ACR_44_0
-reg_read regDIG2_HDMI_ACR_44_1
-reg_read regDIG2_HDMI_ACR_48_0
-reg_read regDIG2_HDMI_ACR_48_1
-reg_read regDIG2_HDMI_ACR_STATUS_0
-reg_read regDIG2_HDMI_ACR_STATUS_1
-reg_read regDIG3_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG3_HDMI_CONTROL
-reg_read regDIG3_HDMI_STATUS
-reg_read regDIG3_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG3_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG3_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG3_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG3_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG3_HDMI_GC
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG3_HDMI_DB_CONTROL
-reg_read regDIG3_HDMI_ACR_32_0
-reg_read regDIG3_HDMI_ACR_32_1
-reg_read regDIG3_HDMI_ACR_44_0
-reg_read regDIG3_HDMI_ACR_44_1
-reg_read regDIG3_HDMI_ACR_48_0
-reg_read regDIG3_HDMI_ACR_48_1
-reg_read regDIG3_HDMI_ACR_STATUS_0
-reg_read regDIG3_HDMI_ACR_STATUS_1
-reg_read regDIO_HDMI_RXSTATUS_TIMER_CONTROL
-reg_read regHDMI_LINK_ENC_CONTROL
-reg_read regHDMI_LINK_ENC_CLK_CTRL
-reg_read regHDMI_FRL_ENC_CONFIG
-reg_read regHDMI_FRL_ENC_CONFIG2
-reg_read regHDMI_FRL_ENC_METER_BUFFER_STATUS
-reg_read regHDMI_FRL_ENC_MEM_CTRL
-reg_read regHDMI_STREAM_ENC_CLOCK_CONTROL
-reg_read regHDMI_STREAM_ENC_INPUT_MUX_CONTROL
-reg_read regHDMI_STREAM_ENC_CLOCK_RAMP_ADJUSTER_FIFO_STATUS_CONTROL0
-reg_read regHDMI_STREAM_ENC_CLOCK_RAMP_ADJUSTER_FIFO_STATUS_CONTROL1
-reg_read regHDMI_STREAM_ENC_CLOCK_RAMP_ADJUSTER_FIFO_STATUS_CONTROL2
-reg_read regHDMI_TB_ENC_CONTROL
-reg_read regHDMI_TB_ENC_PIXEL_FORMAT
-reg_read regHDMI_TB_ENC_PACKET_CONTROL
-reg_read regHDMI_TB_ENC_ACR_PACKET_CONTROL
-reg_read regHDMI_TB_ENC_VBI_PACKET_CONTROL1
-reg_read regHDMI_TB_ENC_VBI_PACKET_CONTROL2
-reg_read regHDMI_TB_ENC_GC_CONTROL
-reg_read regHDMI_TB_ENC_GENERIC_PACKET_CONTROL0
-reg_read regHDMI_TB_ENC_GENERIC_PACKET_CONTROL1
-reg_read regHDMI_TB_ENC_GENERIC_PACKET_CONTROL2
-reg_read regHDMI_TB_ENC_GENERIC_PACKET0_1_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET2_3_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET4_5_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET6_7_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET8_9_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET10_11_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET12_13_LINE
-reg_read regHDMI_TB_ENC_GENERIC_PACKET14_LINE
-reg_read regHDMI_TB_ENC_DB_CONTROL
-reg_read regHDMI_TB_ENC_ACR_32_0
-reg_read regHDMI_TB_ENC_ACR_32_1
-reg_read regHDMI_TB_ENC_ACR_44_0
-reg_read regHDMI_TB_ENC_ACR_44_1
-reg_read regHDMI_TB_ENC_ACR_48_0
-reg_read regHDMI_TB_ENC_ACR_48_1
-reg_read regHDMI_TB_ENC_ACR_STATUS_0
-reg_read regHDMI_TB_ENC_ACR_STATUS_1
-reg_read regHDMI_TB_ENC_BUFFER_CONTROL
-reg_read regHDMI_TB_ENC_MEM_CTRL
-reg_read regHDMI_TB_ENC_METADATA_PACKET_CONTROL
-reg_read regHDMI_TB_ENC_H_ACTIVE_BLANK
-reg_read regHDMI_TB_ENC_HC_ACTIVE_BLANK
-reg_read regHDMI_TB_ENC_CRC_CNTL
-reg_read regHDMI_TB_ENC_CRC_RESULT_0
-reg_read regHDMI_TB_ENC_ENCRYPTION_CONTROL
-reg_read regHDMI_TB_ENC_MODE
-reg_read regHDMI_TB_ENC_INPUT_FIFO_STATUS
-reg_read regHDMI_TB_ENC_CRC_RESULT_1
+	# 2. Try raw .h header with direct version (e.g. 3.2.1 → dcn_3_2_1_offset.h)
+	file_prefix="${dcn_ver//./_}"   # 3.2.1 → 3_2_1
+	if [ -f "$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_offset.h" ]; then
+		OFFSET_FILE="$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_offset.h"
+		SHMASK_FILE="$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_sh_mask.h"
+		USE_TXT=0
+		return 0
+	fi
 
-echo -e "\n====DCCG===="
-reg_read regDCCG_GATE_DISABLE_CNTL4
-reg_read regDCCG_GLOBAL_FGCG_REP_CNTL
-reg_read regDCCG_AUDIO_DTO2_PHASE
-reg_read regDCCG_AUDIO_DTO2_MODULO
-reg_read regDCCG_GATE_DISABLE_CNTL5
-reg_read regDCCG_GATE_DISABLE_CNTL
-reg_read regDCCG_CAC_STATUS
-reg_read regDCCG_GATE_DISABLE_CNTL2
-reg_read regDCCG_DISP_CNTL_REG
-reg_read regDCCG_CAC_STATUS2
-reg_read regDCCG_SOFT_RESET
-reg_read regDCCG_GATE_DISABLE_CNTL6
-reg_read regDCCG_AUDIO_DTO_SOURCE
-reg_read regDCCG_AUDIO_DTO0_PHASE
-reg_read regDCCG_AUDIO_DTO0_MODULE
-reg_read regDCCG_AUDIO_DTO1_PHASE
-reg_read regDCCG_AUDIO_DTO1_MODULE
-reg_read regDCCG_VSYNC_OTG0_LATCH_VALUE
-reg_read regDCCG_VSYNC_OTG1_LATCH_VALUE
-reg_read regDCCG_VSYNC_OTG2_LATCH_VALUE
-reg_read regDCCG_VSYNC_OTG3_LATCH_VALUE
-reg_read regDCCG_VSYNC_OTG4_LATCH_VALUE
-reg_read regDCCG_VSYNC_OTG5_LATCH_VALUE
-reg_read regDCCG_VSYNC_CNT_CTRL
-reg_read regDCCG_VSYNC_CNT_INT_CTRL
-reg_read regDCCG_TEST_CLK_SEL
-reg_read regDCCG_GATE_DISABLE_CNTL3
-reg_read regDCCG_INTERRUPT_DEST
+	# 3. Try mapped file prefix from DCN_VERSION_MAP (e.g. "4.0.1" → "4_1_0")
+	if [ -n "${DCN_VERSION_MAP[$dcn_ver]+x}" ]; then
+		file_prefix="${DCN_VERSION_MAP[$dcn_ver]}"
+		# Try .txt with mapped prefix (e.g. 4_1_0 → dcn410_regs.txt)
+		compact_ver="${file_prefix//_/}"
+		if [ -f "$SCRIPT_DIR/dcn${compact_ver}_regs.txt" ] && \
+		   [ -f "$SCRIPT_DIR/dcn${compact_ver}_sh_mask.txt" ]; then
+			OFFSET_FILE="$SCRIPT_DIR/dcn${compact_ver}_regs.txt"
+			SHMASK_FILE="$SCRIPT_DIR/dcn${compact_ver}_sh_mask.txt"
+			USE_TXT=1
+			return 0
+		fi
+		# Try .h with mapped prefix
+		if [ -f "$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_offset.h" ]; then
+			OFFSET_FILE="$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_offset.h"
+			SHMASK_FILE="$SCRIPT_DIR/dcn_reg/dcn_${file_prefix}_sh_mask.h"
+			USE_TXT=0
+			return 0
+		fi
+	fi
 
-echo -e "\n====HPO===="
-reg_read regHPO_INTERRUPT_DEST
-reg_read regHPO_TOP_CLOCK_CONTROL
-reg_read regHPO_TOP_HW_CONTROL
+	return 1
+}
 
-echo -e "\n====DIG===="
-reg_read regDIG_INTERRUPT_DEST
-reg_read regDIG0_DIG_FE_CNTL
-reg_read regDIG0_DIG_FE_CLK_CNTL
-reg_read regDIG0_DIG_FE_EN_CNTL
-reg_read regDIG0_DIG_OUTPUT_CRC_CNTL
-reg_read regDIG0_DIG_OUTPUT_CRC_RESULT
-reg_read regDIG0_DIG_CLOCK_PATTERN
-reg_read regDIG0_DIG_TEST_PATTERN
-reg_read regDIG0_DIG_RANDOM_PATTERN_SEED
-reg_read regDIG0_DIG_FIFO_CTRL0
-reg_read regDIG0_DIG_FIFO_CTRL1
-reg_read regDIG0_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG0_HDMI_CONTROL
-reg_read regDIG0_HDMI_STATUS
-reg_read regDIG0_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG0_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG0_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG0_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG0_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG0_HDMI_GC
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG0_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG0_HDMI_DB_CONTROL
-reg_read regDIG0_HDMI_ACR_32_0
-reg_read regDIG0_HDMI_ACR_32_1
-reg_read regDIG0_HDMI_ACR_44_0
-reg_read regDIG0_HDMI_ACR_44_1
-reg_read regDIG0_HDMI_ACR_48_0
-reg_read regDIG0_HDMI_ACR_48_1
-reg_read regDIG0_HDMI_ACR_STATUS_0
-reg_read regDIG0_HDMI_ACR_STATUS_1
-reg_read regDIG0_AFMT_CNTL
-reg_read regDIG0_DIG_BE_CLK_CNTL
-reg_read regDIG0_DIG_BE_CNTL
-reg_read regDIG0_DIG_BE_EN_CNTL
-reg_read regDIG0_HDCP_INT_CONTROL
-reg_read regDIG0_HDCP_LINK0_STATUS
-reg_read regDIG0_HDCP_I2C_CONTROL_0
-reg_read regDIG0_HDCP_I2C_CONTROL_1
-reg_read regDIG0_TMDS_CNTL
-reg_read regDIG0_TMDS_CONTROL_CHAR
-reg_read regDIG0_TMDS_CONTROL0_FEEDBACK
-reg_read regDIG0_TMDS_STEREOSYNC_CTL_SEL
-reg_read regDIG0_TMDS_SYNC_CHAR_PATTERN_0_1
-reg_read regDIG0_TMDS_SYNC_CHAR_PATTERN_2_3
-reg_read regDIG0_TMDS_CTL_BITS
-reg_read regDIG0_TMDS_DCBALANCER_CONTROL
-reg_read regDIG0_TMDS_SYNC_DCBALANCE_CHAR
-reg_read regDIG0_TMDS_CTL0_1_GEN_CNTL
-reg_read regDIG0_TMDS_CTL2_3_GEN_CNTL
-reg_read regDIG0_DIG_VERSION
-reg_read regDIG1_DIG_FE_CNTL
-reg_read regDIG1_DIG_FE_CLK_CNTL
-reg_read regDIG1_DIG_FE_EN_CNTL
-reg_read regDIG1_DIG_OUTPUT_CRC_CNTL
-reg_read regDIG1_DIG_OUTPUT_CRC_RESULT
-reg_read regDIG1_DIG_CLOCK_PATTERN
-reg_read regDIG1_DIG_TEST_PATTERN
-reg_read regDIG1_DIG_RANDOM_PATTERN_SEED
-reg_read regDIG1_DIG_FIFO_CTRL0
-reg_read regDIG1_DIG_FIFO_CTRL1
-reg_read regDIG1_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG1_HDMI_CONTROL
-reg_read regDIG1_HDMI_STATUS
-reg_read regDIG1_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG1_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG1_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG1_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG1_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG1_HDMI_GC
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG1_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG1_HDMI_DB_CONTROL
-reg_read regDIG1_HDMI_ACR_32_0
-reg_read regDIG1_HDMI_ACR_32_1
-reg_read regDIG1_HDMI_ACR_44_0
-reg_read regDIG1_HDMI_ACR_44_1
-reg_read regDIG1_HDMI_ACR_48_0
-reg_read regDIG1_HDMI_ACR_48_1
-reg_read regDIG1_HDMI_ACR_STATUS_0
-reg_read regDIG1_HDMI_ACR_STATUS_1
-reg_read regDIG1_AFMT_CNTL
-reg_read regDIG1_DIG_BE_CLK_CNTL
-reg_read regDIG1_DIG_BE_CNTL
-reg_read regDIG1_DIG_BE_EN_CNTL
-reg_read regDIG1_HDCP_INT_CONTROL
-reg_read regDIG1_HDCP_I2C_CONTROL_0
-reg_read regDIG1_HDCP_I2C_CONTROL_1
-reg_read regDIG1_TMDS_CNTL
-reg_read regDIG1_TMDS_CONTROL_CHAR
-reg_read regDIG1_TMDS_CONTROL0_FEEDBACK
-reg_read regDIG1_TMDS_STEREOSYNC_CTL_SEL
-reg_read regDIG1_TMDS_SYNC_CHAR_PATTERN_0_1
-reg_read regDIG1_TMDS_SYNC_CHAR_PATTERN_2_3
-reg_read regDIG1_TMDS_CTL_BITS
-reg_read regDIG1_TMDS_DCBALANCER_CONTROL
-reg_read regDIG1_TMDS_SYNC_DCBALANCE_CHAR
-reg_read regDIG1_TMDS_CTL0_1_GEN_CNTL
-reg_read regDIG1_TMDS_CTL2_3_GEN_CNTL
-reg_read regDIG1_DIG_VERSION
-reg_read regDIG2_DIG_FE_CNTL
-reg_read regDIG2_DIG_FE_CLK_CNTL
-reg_read regDIG2_DIG_FE_EN_CNTL
-reg_read regDIG2_DIG_OUTPUT_CRC_CNTL
-reg_read regDIG2_DIG_OUTPUT_CRC_RESULT
-reg_read regDIG2_DIG_CLOCK_PATTERN
-reg_read regDIG2_DIG_TEST_PATTERN
-reg_read regDIG2_DIG_RANDOM_PATTERN_SEED
-reg_read regDIG2_DIG_FIFO_CTRL0
-reg_read regDIG2_DIG_FIFO_CTRL1
-reg_read regDIG2_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG2_HDMI_CONTROL
-reg_read regDIG2_HDMI_STATUS
-reg_read regDIG2_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG2_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG2_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG2_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG2_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG2_HDMI_GC
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG2_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG2_HDMI_DB_CONTROL
-reg_read regDIG2_HDMI_ACR_32_0
-reg_read regDIG2_HDMI_ACR_32_1
-reg_read regDIG2_HDMI_ACR_44_0
-reg_read regDIG2_HDMI_ACR_44_1
-reg_read regDIG2_HDMI_ACR_48_0
-reg_read regDIG2_HDMI_ACR_48_1
-reg_read regDIG2_HDMI_ACR_STATUS_0
-reg_read regDIG2_HDMI_ACR_STATUS_1
-reg_read regDIG2_AFMT_CNTL
-reg_read regDIG2_DIG_BE_CLK_CNTL
-reg_read regDIG2_DIG_BE_CNTL
-reg_read regDIG2_DIG_BE_EN_CNTL
-reg_read regDIG2_HDCP_INT_CONTROL
-reg_read regDIG2_HDCP_I2C_CONTROL_0
-reg_read regDIG2_HDCP_I2C_CONTROL_1
-reg_read regDIG2_TMDS_CNTL
-reg_read regDIG2_TMDS_CONTROL_CHAR
-reg_read regDIG2_TMDS_CONTROL0_FEEDBACK
-reg_read regDIG2_TMDS_STEREOSYNC_CTL_SEL
-reg_read regDIG2_TMDS_SYNC_CHAR_PATTERN_0_1
-reg_read regDIG2_TMDS_SYNC_CHAR_PATTERN_2_3
-reg_read regDIG2_TMDS_CTL_BITS
-reg_read regDIG2_TMDS_DCBALANCER_CONTROL
-reg_read regDIG2_TMDS_SYNC_DCBALANCE_CHAR
-reg_read regDIG2_TMDS_CTL0_1_GEN_CNTL
-reg_read regDIG2_TMDS_CTL2_3_GEN_CNTL
-reg_read regDIG2_DIG_VERSION
-reg_read regDIG3_DIG_FE_CNTL
-reg_read regDIG3_DIG_FE_CLK_CNTL
-reg_read regDIG3_DIG_FE_EN_CNTL
-reg_read regDIG3_DIG_OUTPUT_CRC_CNTL
-reg_read regDIG3_DIG_OUTPUT_CRC_RESULT
-reg_read regDIG3_DIG_CLOCK_PATTERN
-reg_read regDIG3_DIG_TEST_PATTERN
-reg_read regDIG3_DIG_RANDOM_PATTERN_SEED
-reg_read regDIG3_DIG_FIFO_CTRL0
-reg_read regDIG3_DIG_FIFO_CTRL1
-reg_read regDIG3_HDMI_METADATA_PACKET_CONTROL
-reg_read regDIG3_HDMI_CONTROL
-reg_read regDIG3_HDMI_STATUS
-reg_read regDIG3_HDMI_AUDIO_PACKET_CONTROL
-reg_read regDIG3_HDMI_ACR_PACKET_CONTROL
-reg_read regDIG3_HDMI_VBI_PACKET_CONTROL
-reg_read regDIG3_HDMI_INFOFRAME_CONTROL0
-reg_read regDIG3_HDMI_INFOFRAME_CONTROL1
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL0
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL6
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL5
-reg_read regDIG3_HDMI_GC
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL1
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL2
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL3
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL4
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL7
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL8
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL9
-reg_read regDIG3_HDMI_GENERIC_PACKET_CONTROL10
-reg_read regDIG3_HDMI_DB_CONTROL
-reg_read regDIG3_HDMI_ACR_32_0
-reg_read regDIG3_HDMI_ACR_32_1
-reg_read regDIG3_HDMI_ACR_44_0
-reg_read regDIG3_HDMI_ACR_44_1
-reg_read regDIG3_HDMI_ACR_48_0
-reg_read regDIG3_HDMI_ACR_48_1
-reg_read regDIG3_HDMI_ACR_STATUS_0
-reg_read regDIG3_HDMI_ACR_STATUS_1
-reg_read regDIG3_AFMT_CNTL
-reg_read regDIG3_DIG_BE_CLK_CNTL
-reg_read regDIG3_DIG_BE_CNTL
-reg_read regDIG3_DIG_BE_EN_CNTL
-reg_read regDIG3_HDCP_INT_CONTROL
-reg_read regDIG3_HDCP_I2C_CONTROL_0
-reg_read regDIG3_HDCP_I2C_CONTROL_1
-reg_read regDIG3_TMDS_CNTL
-reg_read regDIG3_TMDS_CONTROL_CHAR
-reg_read regDIG3_TMDS_CONTROL0_FEEDBACK
-reg_read regDIG3_TMDS_STEREOSYNC_CTL_SEL
-reg_read regDIG3_TMDS_SYNC_CHAR_PATTERN_0_1
-reg_read regDIG3_TMDS_SYNC_CHAR_PATTERN_2_3
-reg_read regDIG3_TMDS_CTL_BITS
-reg_read regDIG3_TMDS_DCBALANCER_CONTROL
-reg_read regDIG3_TMDS_SYNC_DCBALANCE_CHAR
-reg_read regDIG3_TMDS_CTL0_1_GEN_CNTL
-reg_read regDIG3_TMDS_CTL2_3_GEN_CNTL
-reg_read regDIG3_DIG_VERSION
-reg_read regDIG0_STREAM_MAPPER_CONTROL
-reg_read regDIG1_STREAM_MAPPER_CONTROL
-reg_read regDIG2_STREAM_MAPPER_CONTROL
-reg_read regDIG3_STREAM_MAPPER_CONTROL
-reg_read regDIG4_STREAM_MAPPER_CONTROL
-reg_read regDIG5_STREAM_MAPPER_CONTROL
-reg_read regDIG6_STREAM_MAPPER_CONTROL
+# ---------------------------------------------------------------------------
+# load_registers: source or parse register definitions into bash environment.
+# For .txt files: direct source (they are already valid bash variable assignments).
+# For .h files:  convert #define lines to variable assignments and source them.
+# ---------------------------------------------------------------------------
+load_registers() {
+	if [ "$USE_TXT" -eq 1 ]; then
+		echo "Loading registers from: $OFFSET_FILE"
+		source "$OFFSET_FILE"
+		source "$SHMASK_FILE"
+	else
+		echo "Loading registers from: $OFFSET_FILE"
+		# Parse offset header: #define regNAME 0xVALUE  →  regNAME=0xVALUE
+		source <(grep -E '^#define[[:space:]]+reg[A-Za-z0-9_]+[[:space:]]' "$OFFSET_FILE" | \
+		         awk '{print $2 "=" $3}')
+		# Parse sh_mask header: #define NAME__SHIFT/MASK VALUE  →  NAME__SHIFT=VALUE
+		source <(grep -E '^#define[[:space:]]+[A-Za-z0-9_]+__(SHIFT|MASK)[[:space:]]' "$SHMASK_FILE" | \
+		         awk '{print $2 "=" $3}')
+	fi
+}
 
-echo -e "\n====SYMCLK===="
-reg_read regPHYASYMCLK_CLOCK_CNTL
-reg_read regPHYBSYMCLK_CLOCK_CNTL
-reg_read regPHYCSYMCLK_CLOCK_CNTL
-reg_read regPHYDSYMCLK_CLOCK_CNTL
-reg_read regPHYESYMCLK_CLOCK_CNTL
-reg_read regPHYFSYMCLK_CLOCK_CNTL
-reg_read regPHYGSYMCLK_CLOCK_CNTL
-reg_read regSYMCLKG_CLOCK_ENABLE
-reg_read regSYMCLK32_SE_CNTL
-reg_read regSYMCLK32_LE_CNTL
-reg_read regSYMCLK_CGTT_BLK_CTRL_REG
-reg_read regSYMCLKA_CLOCK_ENABLE
-reg_read regSYMCLKB_CLOCK_ENABLE
-reg_read regSYMCLKC_CLOCK_ENABLE
-reg_read regSYMCLKD_CLOCK_ENABLE
-reg_read regSYMCLKE_CLOCK_ENABLE
-reg_read regSYMCLKF_CLOCK_ENABLE
+# ---------------------------------------------------------------------------
+# get_registers: list register names matching a prefix pattern from the offset file.
+# ---------------------------------------------------------------------------
+get_registers() {
+	local pattern="$1"
+	if [ "$USE_TXT" -eq 1 ]; then
+		grep -E "^${pattern}" "$OFFSET_FILE" | grep -v "_BASE_IDX=" | cut -d '=' -f 1
+	else
+		grep -E "^#define[[:space:]]+${pattern}" "$OFFSET_FILE" | \
+			grep -v "_BASE_IDX" | awk '{print $2}'
+	fi
+}
 
-echo -e "\n====VPG===="
-reg_read regVPG0_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG0_VPG_GENERIC_PACKET_DATA
-reg_read regVPG0_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG0_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG0_VPG_GENERIC_STATUS
-reg_read regVPG0_VPG_MEM_PWR
-reg_read regVPG0_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG0_VPG_ISRC1_2_DATA
-reg_read regVPG0_VPG_MPEG_INFO0
-reg_read regVPG0_VPG_MPEG_INFO1
-reg_read regVPG1_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG1_VPG_GENERIC_PACKET_DATA
-reg_read regVPG1_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG1_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG1_VPG_GENERIC_STATUS
-reg_read regVPG1_VPG_MEM_PWR
-reg_read regVPG1_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG1_VPG_ISRC1_2_DATA
-reg_read regVPG1_VPG_MPEG_INFO0
-reg_read regVPG1_VPG_MPEG_INFO1
-reg_read regVPG2_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG2_VPG_GENERIC_PACKET_DATA
-reg_read regVPG2_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG2_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG2_VPG_GENERIC_STATUS
-reg_read regVPG2_VPG_MEM_PWR
-reg_read regVPG2_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG2_VPG_ISRC1_2_DATA
-reg_read regVPG2_VPG_MPEG_INFO0
-reg_read regVPG2_VPG_MPEG_INFO1
-reg_read regVPG3_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG3_VPG_GENERIC_PACKET_DATA
-reg_read regVPG3_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG3_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG3_VPG_GENERIC_STATUS
-reg_read regVPG3_VPG_MEM_PWR
-reg_read regVPG3_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG3_VPG_ISRC1_2_DATA
-reg_read regVPG3_VPG_MPEG_INFO0
-reg_read regVPG3_VPG_MPEG_INFO1
-reg_read regVPG4_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG4_VPG_GENERIC_PACKET_DATA
-reg_read regVPG4_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG4_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG4_VPG_GENERIC_STATUS
-reg_read regVPG4_VPG_MEM_PWR
-reg_read regVPG4_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG4_VPG_ISRC1_2_DATA
-reg_read regVPG4_VPG_MPEG_INFO0
-reg_read regVPG4_VPG_MPEG_INFO1
-reg_read regVPG5_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG5_VPG_GENERIC_PACKET_DATA
-reg_read regVPG5_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG5_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG5_VPG_GENERIC_STATUS
-reg_read regVPG5_VPG_MEM_PWR
-reg_read regVPG5_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG5_VPG_ISRC1_2_DATA
-reg_read regVPG5_VPG_MPEG_INFO0
-reg_read regVPG5_VPG_MPEG_INFO1
-reg_read regVPG6_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG6_VPG_GENERIC_PACKET_DATA
-reg_read regVPG6_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG6_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG6_VPG_GENERIC_STATUS
-reg_read regVPG6_VPG_MEM_PWR
-reg_read regVPG6_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG6_VPG_ISRC1_2_DATA
-reg_read regVPG6_VPG_MPEG_INFO0
-reg_read regVPG6_VPG_MPEG_INFO1
-reg_read regVPG7_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG7_VPG_GENERIC_PACKET_DATA
-reg_read regVPG7_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG7_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG7_VPG_GENERIC_STATUS
-reg_read regVPG7_VPG_MEM_PWR
-reg_read regVPG7_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG7_VPG_ISRC1_2_DATA
-reg_read regVPG7_VPG_MPEG_INFO0
-reg_read regVPG7_VPG_MPEG_INFO1
-reg_read regVPG8_VPG_GENERIC_PACKET_ACCESS_CTRL
-reg_read regVPG8_VPG_GENERIC_PACKET_DATA
-reg_read regVPG8_VPG_GSP_FRAME_UPDATE_CTRL
-reg_read regVPG8_VPG_GSP_IMMEDIATE_UPDATE_CTRL
-reg_read regVPG8_VPG_GENERIC_STATUS
-reg_read regVPG8_VPG_MEM_PWR
-reg_read regVPG8_VPG_ISRC1_2_ACCESS_CTRL
-reg_read regVPG8_VPG_ISRC1_2_DATA
-reg_read regVPG8_VPG_MPEG_INFO0
-reg_read regVPG8_VPG_MPEG_INFO1
+# ---------------------------------------------------------------------------
+# reg_read: read one MMIO register and decode its bitfields.
+# ---------------------------------------------------------------------------
+reg_read() {
+	local reg_name=$1
+	local base_idx_var="${reg_name}_BASE_IDX"
+	local base_idx="${!base_idx_var}"
+	local offset="${!reg_name}"
 
-echo -e "\n====DME6===="
-reg_read regDME6_DME_CONTROL
-reg_read regDME6_DME_MEMORY_CONTROL
+	if [ -z "$offset" ] || [ -z "$base_idx" ]; then
+		echo "$reg_name: SKIP (not defined for this DCN version)"
+		return
+	fi
 
-echo -e "\n====AFMT0===="
-reg_read regAFMT0_AFMT_ACP
-reg_read regAFMT0_AFMT_VBI_PACKET_CONTROL
-reg_read regAFMT0_AFMT_AUDIO_PACKET_CONTROL2
-reg_read regAFMT0_AFMT_AUDIO_INFO0
-reg_read regAFMT0_AFMT_AUDIO_INFO1
-reg_read regAFMT0_AFMT_60958_0
-reg_read regAFMT0_AFMT_60958_1
-reg_read regAFMT0_AFMT_AUDIO_CRC_CONTROL
-reg_read regAFMT0_AFMT_RAMP_CONTROL0
-reg_read regAFMT0_AFMT_RAMP_CONTROL1
-reg_read regAFMT0_AFMT_RAMP_CONTROL2
-reg_read regAFMT0_AFMT_RAMP_CONTROL3
-reg_read regAFMT0_AFMT_60958_2
-reg_read regAFMT0_AFMT_AUDIO_CRC_RESULT
-reg_read regAFMT0_AFMT_STATUS
-reg_read regAFMT0_AFMT_AUDIO_PACKET_CONTROL
-reg_read regAFMT0_AFMT_INFOFRAME_CONTROL0
-reg_read regAFMT0_AFMT_INTERRUPT_STATUS
-reg_read regAFMT0_AFMT_AUDIO_SRC_CONTROL
-reg_read regAFMT0_AFMT_AUDIO_DBG_DTO_CNTL
-reg_read regAFMT0_AFMT_MEM_PWR
+	echo -en "$reg_name: "
+	local value
+	value=$(mmio_read32 $(( rbase + 4 * (dcn_base[base_idx] + offset) )))
+	echo "$value"
 
-echo -e "\n====AFMT1===="
-reg_read regAFMT1_AFMT_ACP
-reg_read regAFMT1_AFMT_VBI_PACKET_CONTROL
-reg_read regAFMT1_AFMT_AUDIO_PACKET_CONTROL2
-reg_read regAFMT1_AFMT_AUDIO_INFO0
-reg_read regAFMT1_AFMT_AUDIO_INFO1
-reg_read regAFMT1_AFMT_60958_0
-reg_read regAFMT1_AFMT_60958_1
-reg_read regAFMT1_AFMT_AUDIO_CRC_CONTROL
-reg_read regAFMT1_AFMT_RAMP_CONTROL0
-reg_read regAFMT1_AFMT_RAMP_CONTROL1
-reg_read regAFMT1_AFMT_RAMP_CONTROL2
-reg_read regAFMT1_AFMT_RAMP_CONTROL3
-reg_read regAFMT1_AFMT_60958_2
-reg_read regAFMT1_AFMT_AUDIO_CRC_RESULT
-reg_read regAFMT1_AFMT_STATUS
-reg_read regAFMT1_AFMT_AUDIO_PACKET_CONTROL
-reg_read regAFMT1_AFMT_INFOFRAME_CONTROL0
-reg_read regAFMT1_AFMT_INTERRUPT_STATUS
-reg_read regAFMT1_AFMT_AUDIO_SRC_CONTROL
-reg_read regAFMT1_AFMT_AUDIO_DBG_DTO_CNTL
-reg_read regAFMT1_AFMT_MEM_PWR
+	local reg_basename="${reg_name#reg}"  # strip "reg" prefix
+	local fields=()
+	if [ "$USE_TXT" -eq 1 ]; then
+		readarray -d '' -t fields < <(grep "${reg_basename}__" "$SHMASK_FILE" | grep "_MASK=" | cut -d '=' -f 1)
+	else
+		readarray -d '' -t fields < <(grep -E "^#define[[:space:]]+${reg_basename}__[A-Za-z0-9_]+__MASK[[:space:]]" "$SHMASK_FILE" | awk '{print $2}')
+	fi
 
-echo -e "\n====AFMT2===="
-reg_read regAFMT2_AFMT_ACP
-reg_read regAFMT2_AFMT_VBI_PACKET_CONTROL
-reg_read regAFMT2_AFMT_AUDIO_PACKET_CONTROL2
-reg_read regAFMT2_AFMT_AUDIO_INFO0
-reg_read regAFMT2_AFMT_AUDIO_INFO1
-reg_read regAFMT2_AFMT_60958_0
-reg_read regAFMT2_AFMT_60958_1
-reg_read regAFMT2_AFMT_AUDIO_CRC_CONTROL
-reg_read regAFMT2_AFMT_RAMP_CONTROL0
-reg_read regAFMT2_AFMT_RAMP_CONTROL1
-reg_read regAFMT2_AFMT_RAMP_CONTROL2
-reg_read regAFMT2_AFMT_RAMP_CONTROL3
-reg_read regAFMT2_AFMT_60958_2
-reg_read regAFMT2_AFMT_AUDIO_CRC_RESULT
-reg_read regAFMT2_AFMT_STATUS
-reg_read regAFMT2_AFMT_AUDIO_PACKET_CONTROL
-reg_read regAFMT2_AFMT_INFOFRAME_CONTROL0
-reg_read regAFMT2_AFMT_INTERRUPT_STATUS
-reg_read regAFMT2_AFMT_AUDIO_SRC_CONTROL
-reg_read regAFMT2_AFMT_AUDIO_DBG_DTO_CNTL
-reg_read regAFMT2_AFMT_MEM_PWR
+	for field in ${fields[@]}; do
+		local base_name="${field%__MASK}"
+		local field_name="${base_name#"${reg_basename}"}"
+		field_name="${field_name#__}"
+		local shift_field="${base_name}__SHIFT"
+		local mask_val="${!field}"
+		local shift_val="${!shift_field}"
+		if [ -n "$mask_val" ] && [ -n "$shift_val" ]; then
+			echo "    $field_name: $((( value & ${mask_val%L} ) >> shift_val))"
+		fi
+	done
+}
 
-echo -e "\n====AFMT3===="
-reg_read regAFMT3_AFMT_ACP
-reg_read regAFMT3_AFMT_VBI_PACKET_CONTROL
-reg_read regAFMT3_AFMT_AUDIO_PACKET_CONTROL2
-reg_read regAFMT3_AFMT_AUDIO_INFO0
-reg_read regAFMT3_AFMT_AUDIO_INFO1
-reg_read regAFMT3_AFMT_60958_0
-reg_read regAFMT3_AFMT_60958_1
-reg_read regAFMT3_AFMT_AUDIO_CRC_CONTROL
-reg_read regAFMT3_AFMT_RAMP_CONTROL0
-reg_read regAFMT3_AFMT_RAMP_CONTROL1
-reg_read regAFMT3_AFMT_RAMP_CONTROL2
-reg_read regAFMT3_AFMT_RAMP_CONTROL3
-reg_read regAFMT3_AFMT_60958_2
-reg_read regAFMT3_AFMT_AUDIO_CRC_RESULT
-reg_read regAFMT3_AFMT_STATUS
-reg_read regAFMT3_AFMT_AUDIO_PACKET_CONTROL
-reg_read regAFMT3_AFMT_INFOFRAME_CONTROL0
-reg_read regAFMT3_AFMT_INTERRUPT_STATUS
-reg_read regAFMT3_AFMT_AUDIO_SRC_CONTROL
-reg_read regAFMT3_AFMT_AUDIO_DBG_DTO_CNTL
-reg_read regAFMT3_AFMT_MEM_PWR
+# ---------------------------------------------------------------------------
+# dump_section: discover and dump all registers matching a prefix pattern.
+# ---------------------------------------------------------------------------
+dump_section() {
+	local title="$1"
+	local pattern="$2"
+	local regs=()
+	readarray -t regs < <(get_registers "$pattern")
+	if [ ${#regs[@]} -gt 0 ]; then
+		echo -e "\n====${title}===="
+		for reg in "${regs[@]}"; do
+			[ -n "$reg" ] && reg_read "$reg"
+		done
+	fi
+}
 
-echo -e "\n====AFMT4===="
-reg_read regAFMT4_AFMT_ACP
-reg_read regAFMT4_AFMT_VBI_PACKET_CONTROL
-reg_read regAFMT4_AFMT_AUDIO_PACKET_CONTROL2
-reg_read regAFMT4_AFMT_AUDIO_INFO0
-reg_read regAFMT4_AFMT_AUDIO_INFO1
-reg_read regAFMT4_AFMT_60958_0
-reg_read regAFMT4_AFMT_60958_1
-reg_read regAFMT4_AFMT_AUDIO_CRC_CONTROL
-reg_read regAFMT4_AFMT_RAMP_CONTROL0
-reg_read regAFMT4_AFMT_RAMP_CONTROL1
-reg_read regAFMT4_AFMT_RAMP_CONTROL2
-reg_read regAFMT4_AFMT_RAMP_CONTROL3
-reg_read regAFMT4_AFMT_60958_2
-reg_read regAFMT4_AFMT_AUDIO_CRC_RESULT
-reg_read regAFMT4_AFMT_STATUS
-reg_read regAFMT4_AFMT_AUDIO_PACKET_CONTROL
-reg_read regAFMT4_AFMT_INFOFRAME_CONTROL0
-reg_read regAFMT4_AFMT_INTERRUPT_STATUS
-reg_read regAFMT4_AFMT_AUDIO_SRC_CONTROL
-reg_read regAFMT4_AFMT_AUDIO_DBG_DTO_CNTL
-reg_read regAFMT4_AFMT_MEM_PWR
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+# Detect DCN hardware version from dmesg
+dcn_version=$(detect_dcn_version)
+if [ -z "$dcn_version" ]; then
+	echo "Warning: Could not detect DCN version from dmesg."
+	echo "Available header files:"
+	ls "$SCRIPT_DIR/dcn_reg/"dcn_*_offset.h 2>/dev/null | \
+		sed "s|.*dcn_reg/dcn_||;s|_offset\.h||" | tr '_' '.'
+	echo -n "Please enter DCN version (e.g., 3.2.1): "
+	read -r dcn_version
+fi
+echo "Detected DCN version: $dcn_version"
+
+# Find appropriate register definition files
+OFFSET_FILE=""
+SHMASK_FILE=""
+USE_TXT=0
+if ! find_reg_files "$dcn_version"; then
+	echo "Error: No register definition files found for DCN $dcn_version"
+	echo "Available header files:"
+	ls "$SCRIPT_DIR/dcn_reg/"dcn_*_offset.h 2>/dev/null | \
+		sed "s|.*dcn_reg/dcn_||;s|_offset\.h||"
+	exit 1
+fi
+echo "Offset file:  $OFFSET_FILE"
+echo "SH mask file: $SHMASK_FILE"
+
+# Load register definitions into bash environment
+load_registers
+
+# Discover and dump each register section
+for section in "${REG_SECTIONS[@]}"; do
+	title="${section%%:*}"
+	pattern="${section#*:}"
+	dump_section "$title" "$pattern"
+done
