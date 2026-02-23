@@ -33,26 +33,27 @@ dcn_base[2]=$((0x34c0))
 dcn_base[3]=$((0x9000))
 
 # ---------------------------------------------------------------------------
-# Register sections to discover and dump: "SECTION_TITLE:grep_prefix_pattern"
-# Each pattern is matched as a prefix against register names in the offset file.
+# Register sections to discover and dump: "SECTION_TITLE:bare_name_pattern"
+# Patterns are bare register name prefixes WITHOUT the reg/mm prefix.
+# The correct prefix is detected at runtime and prepended automatically.
 # Patterns support extended regex (passed to grep -E).
 # ---------------------------------------------------------------------------
 REG_SECTIONS=(
-	"PHY_MUX:regPHY_MUX"
-	"HDMICHARCLOCK:regHDMICHARCLK"
-	"HDMI:regHDMI"
-	"DIO:regDIO"
-	"DIG:regDIG"
-	"DCCG:regDCCG"
-	"HPO:regHPO"
-	"SYMCLK:regSYMCLK"
-	"PHY_SYMCLK:regPHY[A-G]SYMCLK"
-	"VPG:regVPG"
-	"DME:regDME"
-	"AFMT:regAFMT"
-	"DTBCLK:regDTBCLK"
-	"OTG:regOTG"
-	"DENTIST:regDENTIST"
+	"PHY_MUX:PHY_MUX"
+	"HDMICHARCLOCK:HDMICHARCLK"
+	"HDMI:HDMI"
+	"DIO:DIO"
+	"DIG:DIG"
+	"DCCG:DCCG"
+	"HPO:HPO"
+	"SYMCLK:SYMCLK"
+	"PHY_SYMCLK:PHY[A-G]SYMCLK"
+	"VPG:VPG"
+	"DME:DME"
+	"AFMT:AFMT"
+	"DTBCLK:DTBCLK"
+	"OTG:OTG"
+	"DENTIST:DENTIST"
 )
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,26 @@ find_reg_files() {
 }
 
 # ---------------------------------------------------------------------------
+# detect_reg_prefix: determine whether offset file uses "reg" or "mm" prefix.
+# Sets global: REG_PREFIX
+# ---------------------------------------------------------------------------
+detect_reg_prefix() {
+	if [ "$USE_TXT" -eq 1 ]; then
+		if grep -qE '^reg[A-Za-z]' "$OFFSET_FILE"; then
+			echo "reg"
+		else
+			echo "mm"
+		fi
+	else
+		if grep -qE '^#define[[:space:]]+reg[A-Za-z]' "$OFFSET_FILE"; then
+			echo "reg"
+		else
+			echo "mm"
+		fi
+	fi
+}
+
+# ---------------------------------------------------------------------------
 # load_registers: source or parse register definitions into bash environment.
 # For .txt files: direct source (they are already valid bash variable assignments).
 # For .h files:  convert #define lines to variable assignments and source them.
@@ -149,8 +170,8 @@ load_registers() {
 		source "$SHMASK_FILE"
 	else
 		echo "Loading registers from: $OFFSET_FILE"
-		# Parse offset header: #define regNAME 0xVALUE  →  regNAME=0xVALUE
-		source <(grep -E '^#define[[:space:]]+reg[A-Za-z0-9_]+[[:space:]]' "$OFFSET_FILE" | \
+		# Parse offset header: #define (reg|mm)NAME 0xVALUE  →  (reg|mm)NAME=0xVALUE
+		source <(grep -E '^#define[[:space:]]+(reg|mm)[A-Za-z0-9_]+[[:space:]]' "$OFFSET_FILE" | \
 		         awk '{print $2 "=" $3}')
 		# Parse sh_mask header: #define NAME__SHIFT/MASK VALUE  →  NAME__SHIFT=VALUE
 		source <(grep -E '^#define[[:space:]]+[A-Za-z0-9_]+__(SHIFT|MASK)[[:space:]]' "$SHMASK_FILE" | \
@@ -160,9 +181,10 @@ load_registers() {
 
 # ---------------------------------------------------------------------------
 # get_registers: list register names matching a prefix pattern from the offset file.
+# The bare pattern (without reg/mm prefix) is passed in; REG_PREFIX is prepended.
 # ---------------------------------------------------------------------------
 get_registers() {
-	local pattern="$1"
+	local pattern="${REG_PREFIX}${1}"
 	if [ "$USE_TXT" -eq 1 ]; then
 		grep -E "^${pattern}" "$OFFSET_FILE" | grep -v "_BASE_IDX=" | cut -d '=' -f 1
 	else
@@ -190,7 +212,7 @@ reg_read() {
 	value=$(mmio_read32 $(( rbase + 4 * (dcn_base[base_idx] + offset) )))
 	echo "$value"
 
-	local reg_basename="${reg_name#reg}"  # strip "reg" prefix
+	local reg_basename="${reg_name#${REG_PREFIX}}"  # strip "reg" or "mm" prefix
 	local fields=()
 	if [ "$USE_TXT" -eq 1 ]; then
 		readarray -d '' -t fields < <(grep "${reg_basename}__" "$SHMASK_FILE" | grep "_MASK=" | cut -d '=' -f 1)
@@ -256,6 +278,10 @@ if ! find_reg_files "$dcn_version"; then
 fi
 echo "Offset file:  $OFFSET_FILE"
 echo "SH mask file: $SHMASK_FILE"
+
+# Detect register name prefix (reg for DCN 3.1.2+, mm for DCN 3.0.x and older)
+REG_PREFIX=$(detect_reg_prefix)
+echo "Register prefix: ${REG_PREFIX}"
 
 # Load register definitions into bash environment
 load_registers
