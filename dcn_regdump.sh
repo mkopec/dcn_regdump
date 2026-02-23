@@ -59,12 +59,29 @@ REG_SECTIONS=(
 # ---------------------------------------------------------------------------
 # GPU PCI detection
 # ---------------------------------------------------------------------------
-gpu_bdf=$(lspci -D -d 1002: | grep -E "VGA|Display|3D" | head -n 1 | awk '{print $1}')
-if [ -z "$gpu_bdf" ]; then
+mapfile -t gpu_list < <(lspci -D -d 1002: | grep -E "VGA|Display|3D")
+if [ ${#gpu_list[@]} -eq 0 ]; then
 	echo "Error: No AMD GPU found on this system."
 	exit 1
 fi
-echo "Found AMD GPU at $gpu_bdf"
+
+if [ ${#gpu_list[@]} -eq 1 ]; then
+	gpu_bdf=$(echo "${gpu_list[0]}" | awk '{print $1}')
+	echo "Found AMD GPU at $gpu_bdf"
+else
+	echo "Multiple AMD GPUs found:"
+	for i in "${!gpu_list[@]}"; do
+		echo "  [$i] ${gpu_list[$i]}"
+	done
+	echo -n "Select GPU [0-$((${#gpu_list[@]}-1))]: "
+	read -r gpu_idx
+	if ! [[ "$gpu_idx" =~ ^[0-9]+$ ]] || [ "$gpu_idx" -ge "${#gpu_list[@]}" ]; then
+		echo "Error: Invalid selection."
+		exit 1
+	fi
+	gpu_bdf=$(echo "${gpu_list[$gpu_idx]}" | awk '{print $1}')
+	echo "Using AMD GPU at $gpu_bdf"
+fi
 
 resource_file="/sys/bus/pci/devices/$gpu_bdf/resource"
 if [ ! -f "$resource_file" ]; then
@@ -80,10 +97,20 @@ echo "Using $bar_name at $bar_start"
 rbase=$bar_start
 
 # ---------------------------------------------------------------------------
-# detect_dcn_version: parse dmesg for "initialized on DCN X.Y.Z"
+# detect_dcn_version: parse dmesg for "initialized on DCN X.Y.Z".
+# Tries to scope the search to the selected GPU's BDF first; falls back to
+# the last matching line in dmesg (single-GPU systems or old kernel formats).
 # ---------------------------------------------------------------------------
 detect_dcn_version() {
-	dmesg 2>/dev/null | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}'
+	local bdf="${gpu_bdf#*:}"   # strip domain prefix (0000:03:00.0 → 03:00.0)
+	local ver
+	# Try BDF-scoped match first (e.g. "amdgpu 0000:03:00.0: ... DCN 3.2.1")
+	ver=$(dmesg 2>/dev/null | grep "$bdf" | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}')
+	# Fall back to any matching dmesg line
+	if [ -z "$ver" ]; then
+		ver=$(dmesg 2>/dev/null | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}')
+	fi
+	echo "$ver"
 }
 
 # ---------------------------------------------------------------------------
