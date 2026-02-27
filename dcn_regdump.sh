@@ -105,10 +105,10 @@ detect_dcn_version() {
 	local bdf="${gpu_bdf#*:}"   # strip domain prefix (0000:03:00.0 → 03:00.0)
 	local ver
 	# Try BDF-scoped match first (e.g. "amdgpu 0000:03:00.0: ... DCN 3.2.1")
-	ver=$(dmesg 2>/dev/null | grep "$bdf" | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}')
+	ver=$(dmesg 2>/dev/null | grep "$bdf" | grep -oE 'initialized on DCN [0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1 | sed -e's/^.* \([0-9.]\+\)$/\1/' -e's/^\([0-9]\.[0-9.]\)$/\1.0/')
 	# Fall back to any matching dmesg line
 	if [ -z "$ver" ]; then
-		ver=$(dmesg 2>/dev/null | grep -oE 'initialized on DCN [0-9]+\.[0-9]+\.[0-9]+' | tail -1 | awk '{print $NF}')
+		ver=$(dmesg 2>/dev/null | grep -oE 'initialized on DCN [0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1 | sed -e's/^.* \([0-9.]\+\)$/\1/' -e's/^\([0-9]\.[0-9.]\)$/\1.0/')
 	fi
 	echo "$ver"
 }
